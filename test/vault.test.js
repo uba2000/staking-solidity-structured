@@ -1,43 +1,46 @@
+// test/vault.test.js (for NEW Vault.sol with StakeInfo)
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
-describe("Vault Contract Tests", function () {
+describe("New Vault Contract Tests (Task 2 - Time-Locked Staking)", function () {
   let StBTC, stBTC, Vault, vault;
-  let owner, admin, staker1, staker2, nonAdmin; // Signers
+  let owner, adminDeployer, treasury, staker1, staker2, otherUser;
 
-  const APY_BASIS_POINTS = 500; // 5.00%
-  const SECONDS_IN_YEAR = 365 * 24 * 60 * 60;
+  const APY_BASIS_POINTS = 500n; // 5.00% (use BigInt suffix 'n')
+  const SECONDS_IN_YEAR = 365n * 24n * 60n * 60n; // Use BigInt
+  const PROTOCOL_FEE_BASIS_POINTS = 100n; // 1% (use BigInt suffix 'n')
+  const ONE_HUNDRED_PERCENT_BASIS_POINTS = 10000n; // For calculations
 
   beforeEach(async function () {
-    // Get signers
-    [owner, adminSigner, staker1, staker2, nonAdmin] = await ethers.getSigners();
+    [owner, adminDeployer, treasury, staker1, staker2, otherUser] = await ethers.getSigners();
 
     // Deploy StBTC
-    StBTC = await ethers.getContractFactory("StBTC");
-    stBTC = await StBTC.connect(owner).deploy(); // 'owner' deploys StBTC
+    const StBTCFactory = await ethers.getContractFactory("StBTC");
+    stBTC = await StBTCFactory.connect(owner).deploy();
 
-    // Deploy Vault, passing StBTC address. Vault admin will be deployer (adminSigner in this setup if distinct)
-    // For consistency with the contract's constructor, let's have adminSigner deploy Vault
-    Vault = await ethers.getContractFactory("Vault");
-    vault = await Vault.connect(adminSigner).deploy(await stBTC.getAddress());
+    // Deploy Vault
+    const VaultFactory = await ethers.getContractFactory("Vault");
+    vault = await VaultFactory.connect(adminDeployer).deploy(
+      await stBTC.getAddress(),
+      await treasury.getAddress()
+    );
 
     // Transfer StBTC ownership to Vault
-    // The 'owner' of StBTC (who deployed it) must transfer ownership to the vault contract
     await stBTC.connect(owner).transferOwnership(await vault.getAddress());
-
-    // For tests, ensure admin role in Vault matches adminSigner if different from owner
-    // In this setup, adminSigner is the deployer of Vault, so it's already admin.
-    // If owner deployed Vault, you'd do: await vault.connect(owner).changeAdmin(adminSigner.address);
   });
 
   describe("Deployment & Configuration", function () {
-    it("Should set the right StBTC token address", async function () {
+    it("Should set the correct StBTC token address", async function () {
       expect(await vault.stBTC_token()).to.equal(await stBTC.getAddress());
     });
 
     it("Should set the deployer as admin", async function () {
-      expect(await vault.admin()).to.equal(adminSigner.address);
+      expect(await vault.admin()).to.equal(await adminDeployer.getAddress());
+    });
+
+    it("Should set the correct treasury address", async function () {
+      expect(await vault.treasury()).to.equal(await treasury.getAddress());
     });
 
     it("StBTC token should have Vault as its owner", async function () {
@@ -45,291 +48,194 @@ describe("Vault Contract Tests", function () {
     });
   });
 
-  describe("Deposit Registration (registerBtcDeposit)", function () {
-    const btcTxHash = ethers.id("deposit1"); // Generates a bytes32 hash
+  describe("depositAndStake", function () {
     const depositAmount = ethers.parseUnits("100", 18); // 100 stBTC
-    const stakingDuration = 60 * 60 * 24 * 30; // 30 days in seconds
+    const lockDuration = 7n * 24n * 60n * 60n; // 7 days in seconds (BigInt)
 
-    it("Should allow admin to register a deposit", async function () {
-      const initialTimestamp = await time.latest();
-      await expect(
-        vault.connect(adminSigner).registerBtcDeposit(
-          btcTxHash,
-          staker1.address,
-          depositAmount,
-          stakingDuration,
-          nonAdmin.address // Mock finality provider
-        )
-      )
+    it("Should allow a user to deposit and stake BTC (mint stBTC principal)", async function () {
+      const initialStakerBalance = await stBTC.balanceOf(staker1.address);
+      const tx = await vault.connect(staker1).depositAndStake(staker1.address, depositAmount, lockDuration);
+      const receipt = await tx.wait();
+      const block = await ethers.provider.getBlock(receipt.blockNumber);
+      const expectedStartTimestamp = BigInt(block.timestamp);
+
+      await expect(tx)
         .to.emit(vault, "DepositRegistered")
-        .withArgs(
-          btcTxHash,
-          staker1.address,
-          depositAmount,
-          (timestamp) => timestamp > initialTimestamp && timestamp <= initialTimestamp + 10, // Check within a small delta
-          stakingDuration,
-          nonAdmin.address
-        );
+        .withArgs(staker1.address, depositAmount);
 
-      const registeredVault = await vault.vaults(btcTxHash);
-      expect(registeredVault.staker).to.equal(staker1.address);
-      expect(registeredVault.amount).to.equal(depositAmount);
-      expect(registeredVault.stakingDuration).to.equal(stakingDuration);
-      expect(registeredVault.registered).to.be.true;
-      expect(registeredVault.minted).to.be.false;
+      await expect(tx)
+        .to.emit(vault, "LockStarted")
+        .withArgs(staker1.address, depositAmount, lockDuration);
+
+      // Check stBTC balance of staker
+      expect(await stBTC.balanceOf(staker1.address)).to.equal(initialStakerBalance + depositAmount);
+
+      // Check StakeInfo
+      const stakeInfo = await vault.userStakes(staker1.address);
+      expect(stakeInfo.principalAmount).to.equal(depositAmount);
+      expect(stakeInfo.startTimestamp).to.equal(expectedStartTimestamp);
+      expect(stakeInfo.lockDuration).to.equal(lockDuration);
+      expect(stakeInfo.hasWithdrawn).to.be.false;
+      expect(stakeInfo.isActive).to.be.true;
     });
 
-    it("Should prevent non-admin from registering a deposit", async function () {
+    it("Should prevent depositing if user already has an active stake", async function () {
+      await vault.connect(staker1).depositAndStake(staker1.address, depositAmount, lockDuration);
       await expect(
-        vault.connect(nonAdmin).registerBtcDeposit(
-          btcTxHash,
-          staker1.address,
-          depositAmount,
-          stakingDuration,
-          nonAdmin.address
-        )
-      ).to.be.revertedWith("Vault: Caller is not the admin");
+        vault.connect(staker1).depositAndStake(staker1.address, depositAmount, lockDuration)
+      ).to.be.revertedWith("Vault: User already has an active stake. Withdraw first.");
     });
 
-    it("Should prevent registering a deposit with zero amount", async function () {
+    it("Should prevent depositing zero amount", async function () {
       await expect(
-        vault.connect(adminSigner).registerBtcDeposit(
-          btcTxHash,
-          staker1.address,
-          0, // Zero amount
-          stakingDuration,
-          nonAdmin.address
-        )
+        vault.connect(staker1).depositAndStake(staker1.address, 0, lockDuration)
       ).to.be.revertedWith("Vault: Amount must be greater than zero");
     });
 
-    it("Should prevent registering a deposit with zero staking duration", async function () {
+    it("Should prevent depositing with zero lock duration", async function () {
       await expect(
-        vault.connect(adminSigner).registerBtcDeposit(
-          btcTxHash,
-          staker1.address,
-          depositAmount,
-          0, // Zero duration
-          nonAdmin.address
-        )
-      ).to.be.revertedWith("Vault: Staking duration must be positive");
-    });
-
-    it("Should prevent registering an already registered TxHash", async function () {
-      await vault.connect(adminSigner).registerBtcDeposit(
-        btcTxHash,
-        staker1.address,
-        depositAmount,
-        stakingDuration,
-        nonAdmin.address
-      );
-      await expect(
-        vault.connect(adminSigner).registerBtcDeposit(
-          btcTxHash, // Same TxHash
-          staker2.address,
-          depositAmount,
-          stakingDuration,
-          nonAdmin.address
-        )
-      ).to.be.revertedWith("Vault: Deposit already registered for this TxHash");
+        vault.connect(staker1).depositAndStake(staker1.address, depositAmount, 0)
+      ).to.be.revertedWith("Vault: Lock duration must be positive");
     });
   });
 
-  describe("Minting stBTC (mintStBTC)", function () {
-    const btcTxHash = ethers.id("mint_deposit1");
-    const depositAmount = ethers.parseUnits("50", 18);
-    const stakingDuration = 60 * 60 * 24 * 7; // 7 days
+  describe("withdraw", function () {
+    const principalAmount = ethers.parseUnits("1000", 18); // 1000 stBTC
+    const lockDuration7Days = 7n * 24n * 60n * 60n; // 7 days
+    const lockDuration30Days = 30n * 24n * 60n * 60n; // 30 days
 
     beforeEach(async function () {
-      // Admin registers a deposit for staker1
-      await vault.connect(adminSigner).registerBtcDeposit(
-        btcTxHash,
-        staker1.address,
-        depositAmount,
-        stakingDuration,
-        nonAdmin.address
+      // Staker1 deposits
+      await vault.connect(staker1).depositAndStake(staker1.address, principalAmount, lockDuration30Days);
+    });
+
+    it("Should prevent withdrawal before lock duration expires", async function () {
+      await expect(vault.connect(staker1).withdraw()).to.be.revertedWith(
+        "Vault: Lock duration not yet expired"
       );
     });
 
-    it("Should allow the registered staker to mint stBTC", async function () {
-      await expect(vault.connect(staker1).mintStBTC(btcTxHash))
-        .to.emit(vault, "StBTCMinted")
-        .withArgs(btcTxHash, staker1.address, depositAmount);
+    it("Should allow withdrawal after lock duration, mint yield, burn principal, and update state", async function () {
+      const stakeInfoBefore = await vault.userStakes(staker1.address);
+      const timeToIncrease = stakeInfoBefore.lockDuration + 10n; // a bit after lock expires
+      await time.increase(timeToIncrease);
 
-      expect(await stBTC.balanceOf(staker1.address)).to.equal(depositAmount);
-      const registeredVault = await vault.vaults(btcTxHash);
-      expect(registeredVault.minted).to.be.true;
+      const stakerBalanceBeforeWithdraw = await stBTC.balanceOf(staker1.address);
+      const treasuryBalanceBeforeWithdraw = await stBTC.balanceOf(treasury.address);
+
+      // Calculate expected yield (using actual time passed for yield calculation up to withdrawal)
+      // Time passed should be close to lockDuration if we increase exactly to it,
+      // or slightly more if we increase beyond it.
+      // The contract uses `block.timestamp - stake.startTimestamp`
+      const currentTime = BigInt(await time.latest());
+      const actualTimePassedForYield = currentTime - stakeInfoBefore.startTimestamp;
+
+      const expectedGrossYield =
+        (stakeInfoBefore.principalAmount * APY_BASIS_POINTS * actualTimePassedForYield) /
+        (ONE_HUNDRED_PERCENT_BASIS_POINTS * SECONDS_IN_YEAR);
+      const expectedFeeAmount = (expectedGrossYield * PROTOCOL_FEE_BASIS_POINTS) / ONE_HUNDRED_PERCENT_BASIS_POINTS;
+      const expectedNetYield = expectedGrossYield - expectedFeeAmount;
+
+      const tx = await vault.connect(staker1).withdraw();
+
+      await expect(tx)
+        .to.emit(vault, "YieldMinted")
+        .withArgs(staker1.address, expectedNetYield, expectedFeeAmount);
+
+      await expect(tx)
+        .to.emit(vault, "PrincipalWithdrawn")
+        .withArgs(staker1.address, stakeInfoBefore.principalAmount);
+
+      // Staker balance: had principal, gained net yield, then principal burned
+      expect(await stBTC.balanceOf(staker1.address)).to.equal(stakerBalanceBeforeWithdraw - stakeInfoBefore.principalAmount + expectedNetYield);
+
+      // Treasury balance: gained fee amount
+      expect(await stBTC.balanceOf(treasury.address)).to.equal(treasuryBalanceBeforeWithdraw + expectedFeeAmount);
+
+      const stakeInfoAfter = await vault.userStakes(staker1.address);
+      expect(stakeInfoAfter.hasWithdrawn).to.be.true;
+      expect(stakeInfoAfter.isActive).to.be.false;
     });
 
-    it("Should prevent minting if deposit not registered", async function () {
-      const unregisteredTxHash = ethers.id("unregistered");
-      await expect(
-        vault.connect(staker1).mintStBTC(unregisteredTxHash)
-      ).to.be.revertedWith("Vault: Deposit not registered or invalid TxHash");
+    it("Should correctly calculate yield if withdrawal happens exactly at lock expiry", async function () {
+      const stakeInfoBefore = await vault.userStakes(staker1.address);
+      await time.increaseTo(stakeInfoBefore.startTimestamp + stakeInfoBefore.lockDuration);
+
+      const expectedGrossYield =
+        (stakeInfoBefore.principalAmount * APY_BASIS_POINTS * stakeInfoBefore.lockDuration) /
+        (ONE_HUNDRED_PERCENT_BASIS_POINTS * SECONDS_IN_YEAR);
+      const expectedFeeAmount = (expectedGrossYield * PROTOCOL_FEE_BASIS_POINTS) / ONE_HUNDRED_PERCENT_BASIS_POINTS;
+      const expectedNetYield = expectedGrossYield - expectedFeeAmount;
+
+      await expect(vault.connect(staker1).withdraw())
+        .to.emit(vault, "YieldMinted")
+        .withArgs(staker1.address, expectedNetYield, expectedFeeAmount);
     });
 
-    it("Should prevent non-staker from minting", async function () {
-      await expect(
-        vault.connect(staker2).mintStBTC(btcTxHash) // staker2 tries to mint staker1's deposit
-      ).to.be.revertedWith("Vault: Caller is not the registered staker for this deposit");
-    });
 
-    it("Should prevent minting if stBTC already minted for the deposit", async function () {
-      await vault.connect(staker1).mintStBTC(btcTxHash); // First mint
-      await expect(
-        vault.connect(staker1).mintStBTC(btcTxHash) // Second attempt
-      ).to.be.revertedWith("Vault: stBTC already minted for this deposit");
-    });
-
-    it("Should prevent minting if staking period has already ended (safety check)", async function () {
-      const shortDurationTxHash = ethers.id("short_duration_deposit");
-      const shortDuration = 100; // 100 seconds
-      await vault.connect(adminSigner).registerBtcDeposit(
-        shortDurationTxHash,
-        staker1.address,
-        depositAmount,
-        shortDuration, // Short duration
-        nonAdmin.address
+    it("Should prevent withdrawal if stake already withdrawn", async function () {
+      await time.increase(lockDuration30Days + 1000n); // Ensure lock expired
+      await vault.connect(staker1).withdraw(); // First withdrawal
+      await expect(vault.connect(staker1).withdraw()).to.be.revertedWith(
+        "Vault: Stake already withdrawn"
       );
-      // Advance time past the staking duration
-      await time.increase(shortDuration + 10);
-
-      await expect(
-        vault.connect(staker1).mintStBTC(shortDurationTxHash)
-      ).to.be.revertedWith("Vault: Staking period already ended (safety check)");
     });
-  });
 
-  describe("Burning stBTC (burnStBTC)", function () {
-    const btcTxHash = ethers.id("burn_deposit1");
-    const depositAmount = ethers.parseUnits("200", 18);
-    const stakingDuration = 60 * 60 * 24 * 14; // 14 days
-
-    beforeEach(async function () {
-      await vault.connect(adminSigner).registerBtcDeposit(
-        btcTxHash,
-        staker1.address,
-        depositAmount,
-        stakingDuration,
-        nonAdmin.address
+    it("Should prevent withdrawal if no active stake", async function () {
+      // otherUser has no stake
+      await expect(vault.connect(otherUser).withdraw()).to.be.revertedWith(
+        "Vault: No active stake for user"
       );
-      await vault.connect(staker1).mintStBTC(btcTxHash); // Staker mints their stBTC
-    });
-
-    it("Should prevent burning before staking duration ends", async function () {
-      await expect(
-        vault.connect(staker1).burnStBTC(btcTxHash)
-      ).to.be.revertedWith("Vault: Staking duration not yet reached");
-    });
-
-    it("Should allow staker to burn stBTC after staking duration and receive rewards conceptually", async function () {
-      // Advance time past the staking duration
-      const registeredVaultBeforeBurn = await vault.vaults(btcTxHash);
-      const expectedUnlockTime = registeredVaultBeforeBurn.depositTime + registeredVaultBeforeBurn.stakingDuration;
-      await time.increaseTo(expectedUnlockTime);
-
-      const expectedPrincipal = depositAmount;
-      const expectedReward = (((depositAmount * BigInt(APY_BASIS_POINTS)) * registeredVaultBeforeBurn.stakingDuration) / 10000n) / BigInt(SECONDS_IN_YEAR);
-
-      await expect(vault.connect(staker1).burnStBTC(btcTxHash))
-        .to.emit(vault, "StBTCBurned")
-        .withArgs(btcTxHash, staker1.address, expectedPrincipal, expectedReward);
-
-      expect(await stBTC.balanceOf(staker1.address)).to.equal(0);
-      const registeredVaultAfterBurn = await vault.vaults(btcTxHash);
-      expect(registeredVaultAfterBurn.minted).to.be.false;
-    });
-
-    it("Should prevent burning if stBTC not minted", async function () {
-      const noMintTxHash = ethers.id("no_mint_deposit");
-      await vault.connect(adminSigner).registerBtcDeposit(
-        noMintTxHash,
-        staker1.address,
-        depositAmount,
-        stakingDuration,
-        nonAdmin.address
-      );
-      // Advance time
-      const registeredVaultNoMint = await vault.vaults(noMintTxHash);
-      const unlockTimeNoMint = registeredVaultNoMint.depositTime + registeredVaultNoMint.stakingDuration;
-      await time.increaseTo(unlockTimeNoMint);
-
-      await expect(
-        vault.connect(staker1).burnStBTC(noMintTxHash)
-      ).to.be.revertedWith("Vault: No stBTC minted for this deposit or already burned");
-    });
-
-    it("Should prevent non-staker from burning", async function () {
-      // Advance time
-      const registeredVault = await vault.vaults(btcTxHash);
-      const expectedUnlockTime = registeredVault.depositTime + registeredVault.stakingDuration;
-      await time.increaseTo(expectedUnlockTime);
-
-      await expect(
-        vault.connect(staker2).burnStBTC(btcTxHash)
-      ).to.be.revertedWith("Vault: Caller is not the staker for this deposit");
-    });
-
-    it("Should prevent burning if staker has insufficient stBTC balance (e.g., transferred away)", async function () {
-      // Simulate staker transferring away some (or all) stBTC - for this, StBTC would need to be transferable by non-owner
-      // This specific scenario is harder to test directly if StBTC.transfer is restricted by Ownable.
-      // The ERC20 _burn function itself handles insufficient balance, but our check `stBTC_token.balanceOf(msg.sender) >= vault.amount` is explicit.
-      // For this test, we'll assume the internal check `require(stBTC_token.balanceOf(msg.sender) >= vault.amount)` works as intended.
-      // If we wanted to test this explicitly, we'd need a way for staker1 to have less than `depositAmount`.
-      // For now, we trust the explicit require and OpenZeppelin's ERC20 internal checks.
-
-      // Advance time
-      const registeredVault = await vault.vaults(btcTxHash);
-      const expectedUnlockTime = registeredVault.depositTime + registeredVault.stakingDuration;
-      await time.increaseTo(expectedUnlockTime);
-
-      // Artificially reduce staker1's balance (conceptually, this would be a transfer)
-      // This requires Vault to be able to burn less than total, or staker to have less.
-      // We can simulate by trying to burn for a vault where user's balance is 0 (after a first burn)
-      await vault.connect(staker1).burnStBTC(btcTxHash); // First successful burn
-
-      // Second attempt to burn (balance is now 0)
-      await expect(
-        vault.connect(staker1).burnStBTC(btcTxHash)
-      ).to.be.revertedWith("Vault: No stBTC minted for this deposit or already burned"); // Because vault.minted is false
     });
   });
 
   describe("Admin Functions", function () {
     it("Should allow admin to change admin", async function () {
-      await vault.connect(adminSigner).changeAdmin(nonAdmin.address);
-      expect(await vault.admin()).to.equal(nonAdmin.address);
+      await vault.connect(adminDeployer).changeAdmin(otherUser.address);
+      expect(await vault.admin()).to.equal(otherUser.address);
     });
 
     it("Should prevent non-admin from changing admin", async function () {
       await expect(
-        vault.connect(nonAdmin).changeAdmin(staker1.address)
+        vault.connect(otherUser).changeAdmin(staker1.address)
+      ).to.be.revertedWith("Vault: Caller is not the admin");
+    });
+
+    it("Should allow admin to change treasury", async function () {
+      await vault.connect(adminDeployer).changeTreasury(otherUser.address);
+      expect(await vault.treasury()).to.equal(otherUser.address);
+    });
+
+    it("Should prevent non-admin from changing treasury", async function () {
+      await expect(
+        vault.connect(otherUser).changeTreasury(staker1.address)
       ).to.be.revertedWith("Vault: Caller is not the admin");
     });
   });
 
   describe("View Functions", function () {
-    it("getCalculatedUnlockTime should return correct unlock time", async function () {
-      const btcTxHash = ethers.id("view_deposit1");
+    beforeEach(async function () {
       const depositAmount = ethers.parseUnits("10", 18);
-      const stakingDuration = 60 * 60 * 24 * 5; // 5 days
-      await vault.connect(adminSigner).registerBtcDeposit(
-        btcTxHash,
-        staker1.address,
-        depositAmount,
-        stakingDuration,
-        nonAdmin.address
-      );
-      const registeredVault = await vault.vaults(btcTxHash);
-      const expectedUnlockTime = registeredVault.depositTime + registeredVault.stakingDuration;
-
-      expect(await vault.getCalculatedUnlockTime(btcTxHash)).to.equal(expectedUnlockTime);
+      const lockDuration = 7n * 24n * 60n * 60n; // 7 days
+      await vault.connect(staker1).depositAndStake(staker1.address, depositAmount, lockDuration);
     });
 
-    it("getCalculatedUnlockTime should revert for non-registered deposit", async function () {
-      const nonExistentTxHash = ethers.id("non_existent_deposit");
-      await expect(vault.getCalculatedUnlockTime(nonExistentTxHash))
-        .to.be.revertedWith("Vault: Deposit not registered");
+    it("getStakeInfo should return correct stake details for an active stake", async function () {
+      const stakeInfo = await vault.getStakeInfo(staker1.address);
+      expect(stakeInfo.principalAmount).to.equal(ethers.parseUnits("10", 18));
+      expect(stakeInfo.isActive).to.be.true;
+      expect(stakeInfo.hasWithdrawn).to.be.false;
+    });
+
+    it("getCalculatedUnlockTime should return correct unlock time for an active stake", async function () {
+      const stakeInfo = await vault.userStakes(staker1.address); // Get internal struct to access startTimestamp
+      const expectedUnlockTime = stakeInfo.startTimestamp + stakeInfo.lockDuration;
+      expect(await vault.getCalculatedUnlockTime(staker1.address)).to.equal(expectedUnlockTime);
+    });
+
+    it("getCalculatedUnlockTime should revert for user with no active stake", async function () {
+      await expect(vault.getCalculatedUnlockTime(otherUser.address))
+        .to.be.revertedWith("Vault: No active stake for user");
     });
   });
 });

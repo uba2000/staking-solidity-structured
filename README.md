@@ -1,84 +1,105 @@
-# Layer BTC - Enhanced Staking Simulation (Task 2)
+# Layer BTC - Time-Locked Staking Vault with Yield (Task 2)
 
-This project presents an enhanced simulation of the stBTC liquid staking token system for Layer BTC, designed to work conceptually with Bitcoin staking via Babylon. This iteration (Task 2) builds upon the initial mock by incorporating time-based locking, basic APY accrual logic, comprehensive event emissions, and robust unit testing within a Hardhat environment.
+This project implements an EVM-based smart contract system simulating a time-locked staking vault. Users can (conceptually) deposit BTC, receive `stBTC` tokens representing their principal, and earn yield in the form of additional `stBTC` based on a fixed APY and a configurable lock duration. This iteration focuses on user-centric staking, direct yield minting, and comprehensive event tracking.
 
 ## Table of Contents
 
-- [Layer BTC - Enhanced Staking Simulation (Task 2)](#layer-btc---enhanced-staking-simulation-task-2)
+- [Layer BTC - Time-Locked Staking Vault with Yield (Task 2)](#layer-btc---time-locked-staking-vault-with-yield-task-2)
   - [Table of Contents](#table-of-contents)
-  - [1. Use-Case](#1-use-case)
+  - [1. Objective](#1-objective)
   - [2. Contract Architecture](#2-contract-architecture)
-  - [3. User/Staking Flow](#3-userstaking-flow)
-  - [4. Key Features Simulated](#4-key-features-simulated)
-  - [5. Security Assumptions \& Design Considerations](#5-security-assumptions--design-considerations)
+  - [3. User Staking Flow \& Mechanics](#3-user-staking-flow--mechanics)
+    - [Depositing \& Staking](#depositing--staking)
+    - [Time Lock](#time-lock)
+    - [Yield Accrual \& Calculation](#yield-accrual--calculation)
+    - [Withdrawal (Principal + Yield)](#withdrawal-principal--yield)
+    - [Protocol Fee](#protocol-fee)
+  - [4. Event Tracking](#4-event-tracking)
+  - [5. Assumptions \& Simplifications](#5-assumptions--simplifications)
   - [6. Local Project Setup](#6-local-project-setup)
   - [7. How to Deploy (Locally)](#7-how-to-deploy-locally)
   - [8. How to Test](#8-how-to-test)
 
-## 1. Use-Case
+## 1. Objective
 
-Layer BTC aims to provide a liquid staking solution for Bitcoin. Users will be able to stake their native BTC through protocols like Babylon and, in return, receive `stBTC` – a yield-bearing, ERC-20 compliant token. This `stBTC` token can then be used across various DeFi applications, providing liquidity and utility to otherwise locked BTC. This project simulates the core smart contract mechanics for such a system.
+To extend the stBTC + Vault system to simulate a time-locked BTC staking mechanism where users directly interact with the vault, lock their stake for a chosen duration, and earn a fixed APY yield, which is paid out in `stBTC` upon withdrawal.
 
 ## 2. Contract Architecture
 
-The system comprises two main smart contracts:
+The system consists of two primary smart contracts:
 
 - **`StBTC.sol`**:
 
-  - An ERC-20 standard token representing the liquid staked Bitcoin.
-  - Inherits from OpenZeppelin's `ERC20.sol` for standard token functionality and `Ownable.sol` for access control.
-  - Minting and burning of `stBTC` tokens are restricted to the `Vault.sol` contract, ensuring that token supply is managed according to staked collateral.
+  - An ERC-20 standard token (`stBTC`) that represents both the staked principal and the accrued yield.
+  - Its minting and burning operations are exclusively controlled by the `Vault.sol` contract.
 
 - **`Vault.sol`**:
-  - The core logic contract that manages the entire staking, minting, and redemption process for `stBTC`.
-  - **Deposit Registration:** An `admin` (simulating a trusted oracle or bridge connected to Babylon) registers verified BTC deposits.
-  - **Time-Locking:** Enforces a `stakingDuration` for each deposit, during which the principal (represented by `stBTC`) cannot be redeemed.
-  - **APY Simulation:** Calculates conceptual yield based on a hardcoded APY (`5%`) and the staking duration. This reward is noted upon burning `stBTC`.
-  - **Minting/Burning:** Handles the minting of `stBTC` to stakers upon successful deposit registration and the burning of `stBTC` upon redemption after the lock-up period.
-  - **Event Emission:** Emits detailed events for all significant actions (deposit registration, minting, burning) for off-chain tracking and potential frontend integration.
+  - The central contract managing user stakes, time locks, yield calculation, and `stBTC` lifecycle.
+  - **User Stakes:** Maintains a record of each user's stake (`principalAmount`, `startTimestamp`, `lockDuration`, `isActive`, `hasWithdrawn`) in a `mapping(address => StakeInfo)`.
+  - **Time-Locking:** Enforces the `lockDuration` chosen by the user at the time of deposit.
+  - **Yield Generation:** Mints new `stBTC` tokens as yield to the user upon successful withdrawal after the lock period.
+  - **Principal Management:** Mints `stBTC` for the principal upon deposit and burns it upon withdrawal.
+  - **Admin & Treasury:** Includes an `admin` for contract management (e.g., changing the treasury address) and a `treasury` address to collect protocol fees on earned yield.
 
-## 3. User/Staking Flow
+## 3. User Staking Flow & Mechanics
 
-The simulated interaction flow is as follows:
+### Depositing & Staking
 
-1.  **(Off-Chain) BTC Staking via Babylon:** A user stakes their native Bitcoin using Babylon's staking mechanism. This process involves locking BTC on the Bitcoin blockchain according to Babylon's specifications and results in a unique transaction identifier (e.g., `btcTxHash`).
-2.  **(Simulated Oracle) Deposit Registration:**
-    - A trusted entity (the `admin` of the `Vault.sol` contract, simulating an oracle system or the Layer BTC backend) verifies the successful Babylon stake off-chain.
-    - The `admin` then calls the `registerBtcDeposit(bytes32 btcTxHash, address staker, uint256 amount, uint256 stakingDuration, address finalityProvider)` function on the `Vault.sol` contract.
-    - This records the stake details, including the principal `amount`, the `staker`'s address, the agreed `stakingDuration`, and the `depositTime` (set to `block.timestamp` of this transaction).
-3.  **Minting `stBTC`:**
-    - The `staker` (whose address was registered in step 2) calls the `mintStBTC(bytes32 btcTxHash)` function on `Vault.sol`, providing the unique `btcTxHash` of their deposit.
-    - The `Vault.sol` contract verifies the deposit and mints an equivalent amount of `stBTC` tokens (1:1 with the principal BTC staked) to the `staker`.
-4.  **Holding `stBTC` (Staking Period):**
-    - The `staker` now holds `stBTC`, which can be used in DeFi (conceptually). The underlying BTC is considered locked for the `stakingDuration` specified.
-5.  **Redemption (Burning `stBTC`):**
-    - After the `stakingDuration` has elapsed (i.e., `block.timestamp >= depositTime + stakingDuration`), the `staker` can initiate redemption.
-    - The `staker` calls the `burnStBTC(bytes32 btcTxHash)` function on `Vault.sol`.
-    - The `Vault.sol` contract verifies that the lock-up period has passed and that the caller is the correct staker.
-    - The `staker`'s `stBTC` (principal amount) is burned.
-    - A conceptual reward amount is calculated based on the principal, the hardcoded APY (`5%`), and the `stakingDuration`.
-    - The `StBTCBurned` event is emitted, including the principal burned and the calculated reward amount. _(Note: In a live system, the actual BTC principal and rewards would be released to the user from the Babylon system or a treasury, a process which is outside the scope of this EVM simulation)._
+1.  A user calls the `depositAndStake(address staker, uint256 amount, uint256 lockDuration)` function on the `Vault.sol` contract.
+    - `staker`: The address for whom the stake is being made (typically `msg.sender`).
+    - `amount`: The principal amount of (conceptual) BTC being staked.
+    - `lockDuration`: The duration (in seconds) for which the user wishes to lock their stake.
+2.  The contract verifies that the user doesn't already have an active stake (this version supports one active stake per user).
+3.  A `StakeInfo` entry is created for the user, recording the `principalAmount`, `lockDuration`, and setting `startTimestamp` to `block.timestamp`.
+4.  The `Vault` contract mints `amount` of `stBTC` tokens (representing the principal) directly to the `staker`.
+5.  Events `DepositRegistered` and `LockStarted` are emitted.
 
-## 4. Key Features Simulated
+### Time Lock
 
-This simulation demonstrates:
+- Once a deposit is made, the `principalAmount` is locked for the specified `lockDuration`, starting from the `startTimestamp`.
+- Users cannot withdraw their principal or earned yield before `startTimestamp + lockDuration`.
 
-- **Oracle-based Deposit Registration:** Mimicking how an external system (like Babylon + Layer BTC oracle) would confirm stakes to the EVM contract.
-- **Time-Based Locking:** Staked assets (represented by `stBTC`) are locked for a defined `stakingDuration`.
-- **APY Accrual Simulation:** A conceptual calculation of yield based on a fixed APY and staking duration.
-- **1:1 Backing of Principal:** `stBTC` is minted 1:1 against the principal BTC staked.
-- **ERC-20 Compliance:** `stBTC` adheres to the ERC-20 standard.
-- **Event-Driven Tracking:** Emission of events for key on-chain actions.
-- **Access Control:** Proper use of `Ownable` for token control and an `admin` role for vault management.
+### Yield Accrual & Calculation
 
-## 5. Security Assumptions & Design Considerations
+- A fixed Annual Percentage Yield (APY) is defined in the contract (e.g., `5%`, stored as `APY_BASIS_POINTS = 500`).
+- Yield is calculated proportionally to the `principalAmount` and the actual `timePassed` since the `startTimestamp` up to the point of withdrawal (or capped at `lockDuration` if a different policy is desired - current implementation uses actual time passed if withdrawal is after lock expiry).
+- Formula (conceptual):
+  `GrossYield = (Principal * APY_Basis_Points * TimePassedInSeconds) / (10000 * SecondsInYear)`
 
-- **Admin Role Security:** The `admin` account in `Vault.sol` is a critical point of trust in this simulation. In a production system, this would be a secure multi-signature wallet, a decentralized oracle network, or a permissioned relayer system. Its compromise would allow fraudulent deposit registrations.
-- **`btcTxHash` Uniqueness:** The `bytes32 btcTxHash` provided by the admin is assumed to be globally unique for each valid and distinct BTC deposit on Babylon. The contract prevents re-registration of the same `btcTxHash`.
-- **Smart Contract Risks:** Standard smart contract risks (re-entrancy, integer overflow/underflow, etc.) apply. OpenZeppelin contracts are used for standard components to mitigate some of these. The current APY calculation is simple and uses basis points to handle percentages; care must be taken with fixed-point arithmetic in more complex financial calculations.
-- **Gas Costs:** While not optimized for gas in this simulation, real-world deployment would require gas efficiency considerations.
-- **Reward Distribution:** The current simulation only _calculates_ rewards and emits them in an event. A production system would need a separate mechanism and potentially a rewards pool to distribute actual BTC or other reward tokens.
-- **No Slashing Logic:** This simulation does not include any slashing conditions or penalties that might exist in the underlying Babylon staking protocol.
+### Withdrawal (Principal + Yield)
+
+1.  After the `lockDuration` has expired (`block.timestamp >= startTimestamp + lockDuration`), the staker calls the `withdraw()` function.
+2.  The contract calculates the `grossYieldAmount` earned.
+3.  A protocol fee (e.g., `1%`, defined by `PROTOCOL_FEE_BASIS_POINTS`) is deducted from the `grossYieldAmount`.
+4.  The `netYieldAmount` (Gross Yield - Protocol Fee) of `stBTC` is minted to the staker.
+5.  The `feeAmount` of `stBTC` is minted to the `treasury` address.
+6.  The original `principalAmount` of `stBTC` is burned from the staker's balance.
+7.  The user's `StakeInfo` is updated to mark the stake as withdrawn (`hasWithdrawn = true`, `isActive = false`) to prevent re-entry for the same stake.
+8.  Events `YieldMinted` and `PrincipalWithdrawn` are emitted.
+
+### Protocol Fee
+
+- A small percentage (e.g., 1%) of the _earned gross yield_ is taken as a protocol fee.
+- This fee is minted as `stBTC` and sent to a designated `treasury` address.
+
+## 4. Event Tracking
+
+The following events are emitted to track important actions:
+
+- `DepositRegistered(address indexed user, uint256 amount)`: When a user's deposit is registered and principal `stBTC` is minted.
+- `LockStarted(address indexed user, uint256 amount, uint256 duration)`: When the lock period for a user's stake begins.
+- `YieldMinted(address indexed user, uint256 netYieldAmount, uint256 feeAmount)`: When yield `stBTC` (net to user and fee to treasury) is minted upon withdrawal.
+- `PrincipalWithdrawn(address indexed user, uint256 amount)`: When a user's principal `stBTC` is burned upon withdrawal.
+
+## 5. Assumptions & Simplifications
+
+- **Single Active Stake Per User:** The current implementation allows only one active stake per user at a time. To deposit more or change lock duration, the user must first withdraw their existing stake.
+- **Conceptual BTC Deposit:** The actual deposit of BTC to the vault is conceptual. The `depositAndStake` function initiates the record-keeping and `stBTC` minting on the EVM side.
+- **Fixed APY:** The APY is hardcoded as a constant. In a real system, this might be variable and managed externally.
+- **Yield Minting:** Yield is paid by minting new `stBTC`. This implies that `stBTC` becomes a yield-bearing token where its total supply grows not just from new principal but also from accrued yield.
+- **Admin Role:** The `admin` can change the `treasury` address and its own `admin` address. For the `depositAndStake` function, it's currently designed to be callable by any user to simulate direct vault interaction.
+- **No Slashing:** Slashing mechanisms are not included.
+- **Gas Optimization:** Code is not specifically optimized for gas.
 
 ## 6. Local Project Setup
 
@@ -100,26 +121,17 @@ To set up and run this project locally:
 
 The project includes a Hardhat script to deploy the contracts to a local Hardhat Network.
 
-1.  **Start a Local Hardhat Node (Optional, if you want a persistent node):**
-    ```bash
-    npx hardhat node
-    ```
-    Then, in another terminal, run the deploy script targeting this node:
-    ```bash
-    npx hardhat run scripts/deploy.js --network localhost
-    ```
-2.  **Deploy Directly to the In-Memory Hardhat Network:**
-    If you don't start a separate node, this command will use a temporary in-memory Hardhat Network:
-    ```bash
-    npx hardhat run scripts/deploy.js
-    ```
-    _(Note: `--network localhost` is often the default for `npx hardhat run` if no other default is specified in `hardhat.config.js`)_
+1. **Run Deployment Script:**
+   ```bash
+   npx hardhat run scripts/deploy.js
+   ```
+   _(This typically uses the default in-memory Hardhat Network. Add `--network localhost` if you have a separate `npx hardhat node` running)._
 
-Upon successful deployment, the script will output the addresses of the deployed `StBTC` and `Vault` contracts to the console.
+Upon successful deployment, the script will output the addresses of the deployed `StBTC` and `Vault` contracts, and the treasury address used.
 
 ## 8. How to Test
 
-The project includes comprehensive unit tests for the `Vault.sol` contract using Hardhat, Ethers.js, and Chai.
+The project includes unit tests for the `Vault.sol` contract using Hardhat, Ethers.js, and Chai, covering the new user-centric staking flow, time-locks, yield minting, and withdrawal logic.
 
 To run the tests:
 
