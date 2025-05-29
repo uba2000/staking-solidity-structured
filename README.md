@@ -86,8 +86,8 @@ To set up and run this project locally:
 
 1.  **Clone the Repository:**
     ```bash
-    git clone [YOUR_GITHUB_REPOSITORY_LINK]
-    cd [YOUR_REPOSITORY_NAME]
+    git clone https://github.com/uba2000/staking-solidity-structured
+    cd staking-solidity-structured
     ```
 2.  **Install Dependencies:**
     Ensure you have Node.js and npm (or Yarn) installed. Then, run:
